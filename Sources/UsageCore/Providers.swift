@@ -9,42 +9,145 @@ public struct ClaudeProvider: UsageProvider {
 
     public func load() async -> ProviderSnapshot {
         do {
-            let raw = try Credentials.keychainPassword(service: "Claude Code-credentials")
-            let stored = try JSONValue.object(from: Data(raw.utf8))
-            guard let oauth = JSONValue.dictionary(stored["claudeAiOauth"]),
-                  let token = JSONValue.string(oauth["accessToken"]), !token.isEmpty else {
-                throw UsageFailure.signedOut("Claude Code")
+            for session in Self.sessions() {
+                do {
+                    return try await Self.fetch(token: session.token, plan: session.plan)
+                } catch let failure as UsageFailure {
+                    guard case .expired = failure else { throw failure }
+                }
             }
-            if let expiry = Dates.parse(oauth["expiresAt"]), expiry < Date() {
-                throw UsageFailure.expired("Claude Code")
+            if let renewed = try? await Self.refreshKeychain() {
+                return try await Self.fetch(token: renewed.token, plan: renewed.plan)
             }
-            let plan = Self.planLabel(
-                subscription: JSONValue.string(oauth["subscriptionType"]),
-                tier: JSONValue.string(oauth["rateLimitTier"])
-            )
-            var request = HTTP.request(
-                URL(string: "https://api.anthropic.com/api/oauth/usage")!,
-                method: "GET",
-                headers: [
-                    "Authorization": "Bearer \(token)",
-                    "Accept": "application/json",
-                    "anthropic-beta": "oauth-2025-04-20",
-                    "User-Agent": "claude-cli/2.1.294 (external, cli)",
-                ]
-            )
-            request.httpMethod = "GET"
-            let response = try await HTTP.send(request)
-            guard (200..<300).contains(response.status) else {
-                throw response.status == 401
-                    ? UsageFailure.expired("Claude Code")
-                    : UsageFailure.http(provider: "Claude", status: response.status)
-            }
-            return try Self.parse(response.body, plan: plan)
+            throw Self.sessions().isEmpty && Self.keychainOAuth() == nil
+                ? UsageFailure.signedOut("Claude Code")
+                : UsageFailure.expired("Claude Code")
         } catch let failure as UsageFailure {
             return Self.failure(failure)
         } catch {
             return Self.failure(.signedOut("Claude Code"))
         }
+    }
+
+    private struct Session {
+        var token: String
+        var expiry: Date
+        var plan: String?
+    }
+
+    private static let service = "Claude Code-credentials"
+
+    /// Live access tokens, newest expiry first. The Claude app's session is included
+    /// because that is what stays signed in while the CLI keychain token ages out.
+    private static func sessions() -> [Session] {
+        var found: [Session] = []
+        if let oauth = keychainOAuth(), let token = usableAccess(oauth) {
+            found.append(Session(
+                token: token,
+                expiry: Dates.parse(oauth["expiresAt"]) ?? .distantFuture,
+                plan: planLabel(
+                    subscription: JSONValue.string(oauth["subscriptionType"]),
+                    tier: JSONValue.string(oauth["rateLimitTier"])
+                )
+            ))
+        }
+        let soon = Date().addingTimeInterval(60)
+        for login in ClaudeDesktopCredentials.logins() {
+            let expiry = login.expiry ?? .distantFuture
+            guard expiry > soon else { continue }
+            found.append(Session(
+                token: login.accessToken,
+                expiry: expiry,
+                plan: planLabel(subscription: login.subscription, tier: login.tier)
+            ))
+        }
+        return found.sorted { $0.expiry > $1.expiry }
+    }
+
+    private static func keychainOAuth() -> [String: Any]? {
+        guard let raw = try? Credentials.keychainPassword(service: service, account: NSUserName()),
+              let stored = try? JSONValue.object(from: Data(raw.utf8)) else { return nil }
+        return JSONValue.dictionary(stored["claudeAiOauth"])
+    }
+
+    private static func refreshKeychain() async throws -> Session {
+        let account = NSUserName()
+        guard let oauth = keychainOAuth() else { throw UsageFailure.signedOut("Claude Code") }
+        let plan = planLabel(
+            subscription: JSONValue.string(oauth["subscriptionType"]),
+            tier: JSONValue.string(oauth["rateLimitTier"])
+        )
+        guard let refreshToken = JSONValue.string(oauth["refreshToken"]), !refreshToken.isEmpty else {
+            throw UsageFailure.expired("Claude Code")
+        }
+        if let refreshExpiry = Dates.parse(oauth["refreshTokenExpiresAt"]), refreshExpiry < Date() {
+            throw UsageFailure.expired("Claude Code")
+        }
+        let scopes = JSONValue.array(oauth["scopes"])?.compactMap { $0 as? String } ?? []
+        let refreshed = try await ClaudeOAuth.refresh(refreshToken: refreshToken, scopes: scopes)
+        _ = try save(account: account, expectedRefresh: refreshToken, refreshed: refreshed)
+        return Session(token: refreshed.accessToken, expiry: refreshed.expiresAt, plan: plan)
+    }
+
+    private static func usableAccess(_ oauth: [String: Any]) -> String? {
+        guard let token = JSONValue.string(oauth["accessToken"]), !token.isEmpty else { return nil }
+        if let expiry = Dates.parse(oauth["expiresAt"]), expiry <= Date().addingTimeInterval(60) {
+            return nil
+        }
+        return token
+    }
+
+    private static func save(account: String, expectedRefresh: String, refreshed: OAuthRefresh) throws -> Bool {
+        var lastError: Error?
+        for _ in 0..<3 {
+            do {
+                return try Credentials.updateJSON(
+                    service: service,
+                    account: account,
+                    decode: { try JSONValue.object(from: Data($0.utf8)) },
+                    encode: { object in
+                        String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+                    },
+                    mutate: { root in
+                        guard var oauth = JSONValue.dictionary(root["claudeAiOauth"]),
+                              JSONValue.string(oauth["refreshToken"]) == expectedRefresh else { return false }
+                        oauth["accessToken"] = refreshed.accessToken
+                        oauth["refreshToken"] = refreshed.refreshToken
+                        oauth["expiresAt"] = Milliseconds.since1970(refreshed.expiresAt)
+                        if let refreshExpiresAt = refreshed.refreshExpiresAt {
+                            oauth["refreshTokenExpiresAt"] = Milliseconds.since1970(refreshExpiresAt)
+                        }
+                        if let scopes = refreshed.scopes, !scopes.isEmpty {
+                            oauth["scopes"] = scopes
+                        }
+                        root["claudeAiOauth"] = oauth
+                        return true
+                    }
+                )
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? KeychainError.missing
+    }
+
+    private static func fetch(token: String, plan: String?) async throws -> ProviderSnapshot {
+        let response = try await HTTP.send(HTTP.request(
+            URL(string: "https://api.anthropic.com/api/oauth/usage")!,
+            method: "GET",
+            headers: [
+                "Authorization": "Bearer \(token)",
+                "Accept": "application/json",
+                "anthropic-beta": "oauth-2025-04-20",
+                "User-Agent": "claude-cli/2.1.294 (external, cli)",
+            ]
+        ))
+        guard (200..<300).contains(response.status) else {
+            throw response.status == 401
+                ? UsageFailure.expired("Claude Code")
+                : UsageFailure.http(provider: "Claude", status: response.status)
+        }
+        return try parse(response.body, plan: plan)
     }
 
     public static func parse(_ data: Data, plan: String? = nil) throws -> ProviderSnapshot {
@@ -320,48 +423,103 @@ public struct AntigravityProvider: UsageProvider {
 
     public func load() async -> ProviderSnapshot {
         do {
-            let raw = try Credentials.keychainPassword(service: "gemini", account: "antigravity")
-            let token = try GoogleTokenFile.decode(raw)
-            if let expiry = token.expiry, expiry < Date() {
-                throw UsageFailure.expired("Antigravity")
+            let token = try await Self.accessToken()
+            do {
+                return try await Self.fetch(token: token)
+            } catch let failure as UsageFailure {
+                guard case .expired = failure else { throw failure }
+                return try await Self.fetch(token: try await Self.accessToken(forceRefresh: true))
             }
-            let headers = [
-                "Authorization": "Bearer \(token.accessToken)",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": "antigravity/2.24.0 (aidev_client; os_type=darwin; arch=arm64)",
-            ]
-            async let planResponse = HTTP.send(HTTP.request(
-                URL(string: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")!,
-                method: "POST",
-                headers: headers,
-                body: Data(#"{"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}"#.utf8)
-            ))
-            async let quotaResponse = HTTP.send(HTTP.request(
-                URL(string: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")!,
-                method: "POST",
-                headers: headers,
-                body: Data("{}".utf8)
-            ))
-            let quota = try await quotaResponse
-            guard (200..<300).contains(quota.status) else {
-                throw quota.status == 401
-                    ? UsageFailure.expired("Antigravity")
-                    : UsageFailure.http(provider: "Antigravity", status: quota.status)
-            }
-            let plan = try? await planResponse
-            let planName = plan.flatMap { response -> String? in
-                guard (200..<300).contains(response.status),
-                      let body = try? JSONValue.object(from: response.body) else { return nil }
-                let paid = JSONValue.dictionary(body["paidTier"])
-                return JSONValue.string(paid?["name"])
-            }
-            return try Self.parse(quota.body, plan: planName)
         } catch let failure as UsageFailure {
             return Self.empty(failure.description)
         } catch {
             return Self.empty("Sign in to Antigravity")
         }
+    }
+
+    private static let service = "gemini"
+    private static let account = "antigravity"
+
+    private static func accessToken(forceRefresh: Bool = false) async throws -> String {
+        let raw = try Credentials.keychainPassword(service: service, account: account)
+        let stored = try GoogleTokenFile.object(from: raw)
+        let token = try GoogleTokenFile.token(in: stored)
+        let stillValid = token.expiry.map { $0 > Date().addingTimeInterval(60) } ?? true
+        if !forceRefresh, stillValid {
+            return token.accessToken
+        }
+        guard let refreshToken = token.refreshToken, !refreshToken.isEmpty else {
+            throw UsageFailure.expired("Antigravity")
+        }
+        let refreshed = try await AntigravityOAuth.refresh(refreshToken: refreshToken)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let saved = try save(expectedRefresh: refreshToken, refreshed: refreshed, expiry: formatter.string(from: refreshed.expiresAt))
+        if saved { return refreshed.accessToken }
+        let latest = try GoogleTokenFile.decode(try Credentials.keychainPassword(service: service, account: account))
+        return latest.accessToken
+    }
+
+    private static func save(expectedRefresh: String, refreshed: OAuthRefresh, expiry: String) throws -> Bool {
+        var lastError: Error?
+        for _ in 0..<3 {
+            do {
+                return try Credentials.updateJSON(
+                    service: service,
+                    account: account,
+                    decode: { try GoogleTokenFile.object(from: $0) },
+                    encode: { try GoogleTokenFile.wrap($0) },
+                    mutate: { root in
+                        guard var token = JSONValue.dictionary(root["token"]),
+                              JSONValue.string(token["refresh_token"]) == expectedRefresh else { return false }
+                        token["access_token"] = refreshed.accessToken
+                        token["refresh_token"] = refreshed.refreshToken
+                        token["expiry"] = expiry
+                        token["expires_in"] = Int(refreshed.expiresAt.timeIntervalSinceNow.rounded())
+                        root["token"] = token
+                        return true
+                    }
+                )
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? KeychainError.missing
+    }
+
+    private static func fetch(token: String) async throws -> ProviderSnapshot {
+        let headers = [
+            "Authorization": "Bearer \(token)",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "antigravity/2.24.0 (aidev_client; os_type=darwin; arch=arm64)",
+        ]
+        async let planResponse = HTTP.send(HTTP.request(
+            URL(string: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")!,
+            method: "POST",
+            headers: headers,
+            body: Data(#"{"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}"#.utf8)
+        ))
+        async let quotaResponse = HTTP.send(HTTP.request(
+            URL(string: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")!,
+            method: "POST",
+            headers: headers,
+            body: Data("{}".utf8)
+        ))
+        let quota = try await quotaResponse
+        guard (200..<300).contains(quota.status) else {
+            throw quota.status == 401
+                ? UsageFailure.expired("Antigravity")
+                : UsageFailure.http(provider: "Antigravity", status: quota.status)
+        }
+        let plan = try? await planResponse
+        let planName = plan.flatMap { response -> String? in
+            guard (200..<300).contains(response.status),
+                  let body = try? JSONValue.object(from: response.body) else { return nil }
+            let paid = JSONValue.dictionary(body["paidTier"])
+            return JSONValue.string(paid?["name"])
+        }
+        return try Self.parse(quota.body, plan: planName)
     }
 
     public static func parse(_ data: Data, plan: String? = nil) throws -> ProviderSnapshot {
